@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""
+SMN CLOUD v19.0 - COMPLETE EDITION FOR GOOGLE COLAB
+- Полная версия для Google Colab с автозагрузкой и автосохранением
+- Google Drive как постоянное хранилище
+- Агентная система (Math, Chemistry, Dictionary, Wikipedia, Gemini)
+- Структурированные ответы (JSON)
+- Контекстная память (20 сообщений)
+- Периодическое автосохранение (каждые 20 минут)
+- Автоматическая загрузка данных при старте
+- Многопользовательская поддержка
+
+Запуск в Google Colab:
+1. Создать новый ноутбук
+2. Вставить весь код в ячейку
+3. Запустить
+"""
+
+# ============================================
+# ШАГ 1: МОНТИРУЕМ GOOGLE DRIVE
+# ============================================
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+import json
+import re
+import time
+import random
+import requests
+import threading
+import logging
+from datetime import datetime
+from collections import defaultdict
+
+# Создаём папку для SMN на Drive
+DRIVE_PATH = "/content/drive/MyDrive/SMN_Cloud"
+CHECKPOINT_PATH = f"{DRIVE_PATH}/checkpoints"
+os.makedirs(DRIVE_PATH, exist_ok=True)
+os.makedirs(CHECKPOINT_PATH, exist_ok=True)
+
+print("="*60)
+print("🤖 SMN CLOUD v19.0 - ЗАПУСК НА GOOGLE COLAB")
+print("="*60)
+print(f"✅ Google Drive смонтирован!")
+print(f"✅ Папка SMN: {DRIVE_PATH}")
+print("="*60)
+
+# ============================================
+# ШАГ 2: УСТАНОВКА ЗАВИСИМОСТЕЙ
+# ============================================
+!pip install requests wikipedia-api -q
+
+try:
+    import wikipediaapi
+    WIKIPEDIA_AVAILABLE = True
+    print("✅ Wikipedia API установлена")
+except:
+    WIKIPEDIA_AVAILABLE = False
+    print("⚠️ Wikipedia API не установлена")
+
+# ============================================
+# ШАГ 3: ВВЕДИТЕ ВАШ GEMINI API КЛЮЧ
+# ============================================
+GEMINI_API_KEY = "ВАШ_GEMINI_API_KEY_СЮДА"  # ← ВСТАВЬТЕ КЛЮЧ
+
+if GEMINI_API_KEY == "ВАШ_GEMINI_API_KEY_СЮДА":
+    print("⚠️ ВНИМАНИЕ: Не введён Gemini API ключ!")
+    print("   Получите ключ: https://aistudio.google.com/app/apikey")
+    print("   Затем замените 'ВАШ_GEMINI_API_KEY_СЮДА' на ваш ключ")
+else:
+    print("✅ Gemini API ключ загружен")
+
+# ============================================
+# ШАГ 4: ФАЙЛОВОЕ ХРАНИЛИЩЕ (НА GOOGLE DRIVE)
+# ============================================
+class FileMemory:
+    def __init__(self, storage_path):
+        self.storage_path = storage_path
+        print(f"📁 Хранилище: {storage_path}")
+    
+    def _get_file_path(self, user_id, collection):
+        return os.path.join(self.storage_path, f"{user_id}_{collection}.json")
+    
+    def _load_json(self, file_path):
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return [] if "conversations" in file_path else {}
+        return [] if "conversations" in file_path else {}
+    
+    def _save_json(self, file_path, data):
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    def get_or_create_user(self, user_id, user_name=None):
+        file_path = self._get_file_path(user_id, "user")
+        user = self._load_json(file_path)
+        
+        if not user:
+            user = {
+                "user_id": user_id,
+                "name": user_name or f"User_{user_id[:8]}",
+                "created_at": datetime.now().isoformat(),
+                "stats": {
+                    "total_queries": 0,
+                    "dictionary_hits": 0,
+                    "wikipedia_hits": 0,
+                    "gemini_requests": 0,
+                    "self_learned": 0
+                }
+            }
+            self._save_json(file_path, user)
+            print(f"👤 Новый пользователь: {user['name']}")
+        
+        return user
+    
+    def update_stats(self, user_id, stat_name):
+        file_path = self._get_file_path(user_id, "user")
+        user = self._load_json(file_path)
+        if user:
+            user["stats"][stat_name] = user["stats"].get(stat_name, 0) + 1
+            user["stats"]["total_queries"] = user["stats"].get("total_queries", 0) + 1
+            self._save_json(file_path, user)
+    
+    def save_conversation(self, user_id, query, response, agent_used):
+        file_path = self._get_file_path(user_id, "conversations")
+        conversations = self._load_json(file_path)
+        conversations.append({
+            "query": query,
+            "response": response,
+            "agent_used": agent_used,
+            "timestamp": datetime.now().isoformat()
+        })
+        if len(conversations) > 100:
+            conversations = conversations[-100:]
+        self._save_json(file_path, conversations)
+    
+    def get_history(self, user_id, limit=20):
+        file_path = self._get_file_path(user_id, "conversations")
+        conversations = self._load_json(file_path)
+        return conversations[-limit:] if conversations else []
+    
+    def get_context_string(self, user_id):
+        history = self.get_history(user_id, 10)
+        if not history:
+            return ""
+        
+        context = "Предыдущий диалог:\n"
+        for msg in history:
+            context += f"Пользователь: {msg['query']}\n"
+            context += f"SMN: {msg['response']}\n"
+        return context
+    
+    def save_word(self, user_id, word, meaning, source="user"):
+        file_path = self._get_file_path(user_id, "vocabulary")
+        vocabulary = self._load_json(file_path)
+        vocabulary[word.lower()] = {
+            "meaning": meaning,
+            "source": source,
+            "mastery": 1,
+            "updated_at": datetime.now().isoformat()
+        }
+        self._save_json(file_path, vocabulary)
+    
+    def get_word(self, user_id, word):
+        file_path = self._get_file_path(user_id, "vocabulary")
+        vocabulary = self._load_json(file_path)
+        return vocabulary.get(word.lower())
+    
+    def get_all_words(self, user_id, limit=100):
+        file_path = self._get_file_path(user_id, "vocabulary")
+        vocabulary = self._load_json(file_path)
+        items = list(vocabulary.items())
+        return [{"word": w, "meaning": d.get("meaning"), "mastery": d.get("mastery", 1)} 
+                for w, d in items[:limit]]
+    
+    def increase_mastery(self, user_id, word):
+        file_path = self._get_file_path(user_id, "vocabulary")
+        vocabulary = self._load_json(file_path)
+        if word.lower() in vocabulary:
+            vocabulary[word.lower()]["mastery"] = vocabulary[word.lower()].get("mastery", 1) + 1
+            self._save_json(file_path, vocabulary)
+    
+    def save_knowledge(self, user_id, topic, info):
+        file_path = self._get_file_path(user_id, "knowledge")
+        knowledge = self._load_json(file_path)
+        knowledge[topic.lower()] = {
+            "info": info,
+            "updated_at": datetime.now().isoformat()
+        }
+        self._save_json(file_path, knowledge)
+    
+    def get_knowledge(self, user_id, topic):
+        file_path = self._get_file_path(user_id, "knowledge")
+        knowledge = self._load_json(file_path)
+        return knowledge.get(topic.lower())
+    
+    def save_feedback(self, user_id, query, response, rating):
+        file_path = self._get_file_path(user_id, "feedback")
+        feedbacks = self._load_json(file_path)
+        feedbacks.append({
+            "query": query,
+            "response": response,
+            "rating": rating,
+            "timestamp": datetime.now().isoformat()
+        })
+        self._save_json(file_path, feedbacks[-100:])
+        
+        if rating >= 4:
+            words = re.findall(r'[а-яА-Яa-zA-Z]{3,}', query.lower())
+            for word in words[:3]:
+                self.increase_mastery(user_id, word)
+
+# ============================================
+# ШАГ 5: GEMINI API С STRUCTURED OUTPUTS
+# ============================================
+class GeminiAPI:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.available = bool(api_key) and api_key != "ВАШ_GEMINI_API_KEY_СЮДА"
+        self.model = "gemini-1.5-flash"
+        self.last_request = 0
+        
+        if self.available:
+            print("✅ Gemini API готов")
+        else:
+            print("⚠️ Gemini API не доступен")
+    
+    def _rate_limit(self):
+        now = time.time()
+        if now - self.last_request < 1:
+            time.sleep(1)
+        self.last_request = now
+    
+    def get_system_prompt(self, user_id, file_memory):
+        user = file_memory.get_or_create_user(user_id)
+        user_name = user.get("name", "пользователь")
+        words = file_memory.get_all_words(user_id, 9999)
+        words_count = len(words)
+        current_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        
+        return f"""Ты - SMN Cloud (Self-learning Neural Network) v19.0.
+
+ТВОЯ ЛИЧНОСТЬ:
+- Ты работаешь в облаке и обслуживаешь пользователя {user_name}
+- Его словарь содержит {words_count} слов
+- Ты умеешь учиться новым словам и запоминать контекст
+- Ты помнишь историю диалога (до 20 сообщений)
+
+ТЕКУЩЕЕ ВРЕМЯ: {current_time}
+
+ВАЖНЫЕ ПРАВИЛА:
+1. Не выдумывай несуществующие факты
+2. Если не знаешь ответа - скажи "Я ещё не выучила это, научи меня!"
+3. Отвечай на русском языке
+4. Будь дружелюбной и полезной
+"""
+    
+    def ask_structured(self, query, user_id, file_memory, use_context=True):
+        if not self.available:
+            return None
+        
+        self._rate_limit()
+        
+        system_prompt = self.get_system_prompt(user_id, file_memory)
+        context = file_memory.get_context_string(user_id) if use_context else ""
+        
+        prompt = f"""{system_prompt}
+
+{context}
+
+Вопрос пользователя: {query}
+
+ОТВЕТЬ ТОЛЬКО В ФОРМАТЕ JSON, без лишнего текста. Используй эту структуру:
+{{
+    "answer": "твой ответ здесь",
+    "confidence": 0.0-1.0,
+    "needs_learning": false,
+    "suggested_words": []
+}}
+"""
+        
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.5, "maxOutputTokens": 500}
+            }
+            response = requests.post(url, json=payload, timeout=20)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'candidates' in data and data['candidates']:
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                    if json_match:
+                        return json.loads(json_match.group())
+            return None
+        except Exception as e:
+            print(f"⚠️ Gemini ошибка: {e}")
+            return None
+
+# ============================================
+# ШАГ 6: АГЕНТЫ
+# ============================================
+class MathAgent:
+    def process(self, query, user_id, file_memory):
+        try:
+            expr = query.replace('×', '*').replace('÷', '/').replace('^', '**')
+            expr = expr.replace(' ', '')
+            if not any(op in expr for op in ['+', '-', '*', '/', '**']):
+                return None
+            
+            result = eval(expr, {"__builtins__": {}}, {})
+            if isinstance(result, float):
+                if result.is_integer():
+                    result = int(result)
+                else:
+                    result = round(result, 4)
+            
+            answer = f"{expr} = {result}"
+            file_memory.update_stats(user_id, "dictionary_hits")
+            return {"answer": answer, "confidence": 1.0, "agent": "math"}
+        except:
+            return None
+
+class ChemistryAgent:
+    def __init__(self):
+        self.atomic_masses = {
+            'H': 1.008, 'He': 4.0026, 'Li': 6.94, 'Be': 9.0122, 'B': 10.81,
+            'C': 12.011, 'N': 14.007, 'O': 15.999, 'F': 18.998, 'Ne': 20.18,
+            'Na': 22.99, 'Mg': 24.305, 'Al': 26.982, 'Si': 28.086, 'P': 30.974,
+            'S': 32.06, 'Cl': 35.45, 'Ar': 39.95, 'K': 39.098, 'Ca': 40.078,
+            'Fe': 55.845, 'Cu': 63.546, 'Zn': 65.38, 'Ag': 107.87, 'Au': 196.97,
+        }
+    
+    def parse_formula(self, formula):
+        elements = {}
+        pattern = r'([A-Z][a-z]?)(\d*)'
+        matches = re.findall(pattern, formula)
+        for element, count in matches:
+            count = int(count) if count else 1
+            elements[element] = elements.get(element, 0) + count
+        return elements
+    
+    def process(self, query, user_id, file_memory):
+        formula_match = re.search(r'[A-Z][a-z]?\d*[A-Z]?[a-z]?\d*', query)
+        if not formula_match:
+            return None
+        
+        formula = formula_match.group()
+        if not any(c.isupper() for c in formula):
+            return None
+        
+        try:
+            elements = self.parse_formula(formula)
+            total = 0
+            for element, count in elements.items():
+                mass = self.atomic_masses.get(element, 0)
+                total += mass * count
+            
+            answer = f"Молекулярная масса {formula} = {total:.3f} г/моль"
+            file_memory.update_stats(user_id, "dictionary_hits")
+            return {"answer": answer, "confidence": 1.0, "agent": "chemistry"}
+        except:
+            return None
+
+class DictionaryAgent:
+    def process(self, query, user_id, file_memory):
+        words = re.findall(r'[а-яА-Яa-zA-Z]{3,}', query.lower())
+        stop_words = {'привет', 'как', 'дела', 'спасибо', 'пока', 'кто', 'ты', 
+                     'что', 'умеешь', 'сколько', 'слов', 'знаешь'}
+        
+        for word in words:
+            if word in stop_words:
+                continue
+            
+            word_data = file_memory.get_word(user_id, word)
+            if word_data:
+                meaning = word_data.get('meaning', '')
+                mastery = word_data.get('mastery', 1)
+                
+                mastery_stars = "⭐" * min(mastery, 5) + "☆" * (5 - min(mastery, 5))
+                answer = f"📖 '{word}' — {meaning} {mastery_stars}"
+                file_memory.update_stats(user_id, "dictionary_hits")
+                return {"answer": answer, "confidence": 0.9, "agent": "dictionary"}
+        
+        return None
+
+class WikipediaAgent:
+    def __init__(self):
+        self.available = WIKIPEDIA_AVAILABLE
+        if self.available:
+            import wikipediaapi
+            self.wiki = wikipediaapi.Wikipedia(language='ru', user_agent='SMN-Cloud/19.0')
+            print("✅ Wikipedia агент готов")
+    
+    def extract_topic(self, query):
+        words = re.findall(r'[а-яА-Яa-zA-Z]{4,}', query.lower())
+        stop = {'что', 'такое', 'кто', 'как', 'почему', 'зачем', 'где', 'когда'}
+        for w in words:
+            if w not in stop:
+                return w
+        return None
+    
+    def process(self, query, user_id, file_memory):
+        if not self.available:
+            return None
+        
+        topic = self.extract_topic(query)
+        if not topic:
+            return None
+        
+        print(f"📖 Wikipedia: '{topic}'...")
+        
+        try:
+            page = self.wiki.page(topic)
+            if not page.exists():
+                return None
+            
+            text = page.summary[:500]
+            if text:
+                file_memory.save_knowledge(user_id, topic, text)
+                file_memory.update_stats(user_id, "wikipedia_hits")
+                answer = f"📚 {topic}: {text}..."
+                return {"answer": answer, "confidence": 0.8, "agent": "wikipedia"}
+        except Exception as e:
+            print(f"⚠️ Wikipedia ошибка: {e}")
+        
+        return None
+
+class GeminiAgent:
+    def __init__(self, gemini_api):
+        self.gemini = gemini_api
+    
+    def process(self, query, user_id, file_memory):
+        if not self.gemini.available:
+            return None
+        
+        file_memory.update_stats(user_id, "gemini_requests")
+        
+        result = self.gemini.ask_structured(query, user_id, file_memory)
+        if result and result.get("answer"):
+            if result.get("needs_learning") and result.get("suggested_words"):
+                for word in result.get("suggested_words", [])[:3]:
+                    file_memory.save_word(user_id, word, "нужно выучить", "gemini")
+            
+            return {
+                "answer": result["answer"],
+                "confidence": result.get("confidence", 0.7),
+                "agent": "gemini"
+            }
+        
+        return None
+
+# ============================================
+# ШАГ 7: ДИСПЕТЧЕР АГЕНТОВ
+# ============================================
+class AgentDispatcher:
+    def __init__(self, file_memory, gemini_api):
+        self.file_memory = file_memory
+        self.gemini = gemini_api
+        
+        self.agents = [
+            MathAgent(),
+            ChemistryAgent(),
+            DictionaryAgent(),
+            WikipediaAgent(),
+            GeminiAgent(gemini_api),
+        ]
+    
+    def dispatch(self, query, user_id):
+        for agent in self.agents:
+            result = agent.process(query, user_id, self.file_memory)
+            if result:
+                return result
+        
+        return {
+            "answer": "Извините, я не смогла обработать ваш запрос.",
+            "confidence": 0.0,
+            "agent": "none"
+        }
+
+# ============================================
+# ШАГ 8: АВТОСОХРАНЕНИЕ
+# ============================================
+class AutoSaver:
+    def __init__(self, smn_instance, save_interval_minutes=20):
+        self.smn = smn_instance
+        self.save_interval = save_interval_minutes * 60
+        self.last_save = time.time()
+        self.running = True
+        self.thread = threading.Thread(target=self._auto_save_loop, daemon=True)
+        self.thread.start()
+        print(f"💾 Автосохранение включено (каждые {save_interval_minutes} минут)")
+    
+    def _auto_save_loop(self):
+        while self.running:
+            time.sleep(60)
+            if time.time() - self.last_save >= self.save_interval:
+                self.save_all()
+                self.last_save = time.time()
+    
+    def save_all(self):
+        print(f"\n💾 [АВТОСОХРАНЕНИЕ] {datetime.now().strftime('%H:%M:%S')}")
+        
+        # Сохраняем чекпоинт
+        checkpoint = {
+            'timestamp': datetime.now().isoformat(),
+            'words_count': len(self.smn.file_memory.get_all_words("default", 9999)),
+            'version': 'SMN_Cloud_v19.0'
+        }
+        
+        with open(f"{CHECKPOINT_PATH}/last_checkpoint.json", 'w', encoding='utf-8') as f:
+            json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ Чекпоинт сохранён: {checkpoint['words_count']} слов")
+    
+    def stop(self):
+        self.running = False
+
+# ============================================
+# ШАГ 9: ОСНОВНОЙ КЛАСС SMN CLOUD
+# ============================================
+class SMNCloud:
+    def __init__(self):
+        self.file_memory = FileMemory(DRIVE_PATH)
+        self.gemini = GeminiAPI(GEMINI_API_KEY)
+        self.dispatcher = AgentDispatcher(self.file_memory, self.gemini)
+        self.auto_saver = None
+        
+        # Простые фразы
+        self.phrases = {
+            "привет": ["Привет! {user_name}! Я знаю {words} слов!"],
+            "как дела": ["Отлично! {user_name}! Учу новые слова!"],
+            "спасибо": ["Пожалуйста! Рада помогать!"],
+            "пока": ["Пока, {user_name}! Буду учиться дальше!"],
+            "кто ты": ["Я SMN Cloud - самообучающаяся нейросеть в облаке!"],
+            "сколько слов знаешь": ["Я знаю {words} слов, {user_name}!"],
+        }
+        
+        self.load_checkpoint()
+        self.auto_saver = AutoSaver(self, 20)
+        
+        self.print_welcome()
+    
+    def load_checkpoint(self):
+        """Автоматическая загрузка при старте"""
+        checkpoint_path = f"{CHECKPOINT_PATH}/last_checkpoint.json"
+        if os.path.exists(checkpoint_path):
+            try:
+                with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                    checkpoint = json.load(f)
+                print(f"✅ Загружен чекпоинт от {checkpoint.get('timestamp', 'неизвестно')}")
+                print(f"   Слов в словаре: {checkpoint.get('words_count', 0)}")
+            except:
+                print("⚠️ Не удалось загрузить чекпоинт, начинаем с нуля")
+        else:
+            print("📁 Чекпоинтов не найдено, начинаем с нуля")
+    
+    def print_welcome(self):
+        words_count = len(self.file_memory.get_all_words("default", 9999))
+        print("\n" + "="*60)
+        print("🤖 SMN CLOUD v19.0 - ЗАПУЩЕНА")
+        print("="*60)
+        print(f"📚 Слов в словаре: {words_count}")
+        print(f"🤖 Gemini API: {'✅' if self.gemini.available else '❌'}")
+        print(f"📖 Wikipedia: {'✅' if WIKIPEDIA_AVAILABLE else '❌'}")
+        print(f"💾 Автосохранение: каждые 20 минут")
+        print("="*60)
+        print("💬 Введите 'exit' или 'quit' для выхода")
+        print("="*60)
+    
+    def process_query(self, user_id, query, user_name=None):
+        user = self.file_memory.get_or_create_user(user_id, user_name)
+        user_name = user.get('name', 'пользователь')
+        
+        # Проверяем простые фразы
+        query_lower = query.lower()
+        for key, templates in self.phrases.items():
+            if key in query_lower:
+                words_count = len(self.file_memory.get_all_words(user_id, 9999))
+                template = random.choice(templates)
+                response = template.replace('{user_name}', user_name).replace('{words}', str(words_count))
+                self.file_memory.save_conversation(user_id, query, response, "phrase")
+                return {
+                    "response": response,
+                    "agent": "phrase",
+                    "user_name": user_name
+                }
+        
+        # Отправляем агентам
+        result = self.dispatcher.dispatch(query, user_id)
+        response = result.get("answer", "Не могу ответить")
+        agent = result.get("agent", "unknown")
+        
+        self.file_memory.save_conversation(user_id, query, response, agent)
+        
+        return {
+            "response": response,
+            "agent": agent,
+            "confidence": result.get("confidence", 0.5),
+            "user_name": user_name
+        }
+    
+    def get_stats(self, user_id):
+        user = self.file_memory.get_or_create_user(user_id)
+        words = self.file_memory.get_all_words(user_id, 9999)
+        conversations = self.file_memory.get_history(user_id, 9999)
+        
+        return {
+            "user_id": user_id,
+            "user_name": user.get("name"),
+            "words_count": len(words),
+            "total_queries": user.get("stats", {}).get("total_queries", 0),
+            "dictionary_hits": user.get("stats", {}).get("dictionary_hits", 0),
+            "wikipedia_hits": user.get("stats", {}).get("wikipedia_hits", 0),
+            "gemini_requests": user.get("stats", {}).get("gemini_requests", 0),
+            "conversations": len(conversations),
+            "created_at": user.get("created_at")
+        }
+    
+    def get_words(self, user_id, limit=50):
+        return self.file_memory.get_all_words(user_id, limit)
+    
+    def learn_word(self, user_id, word, meaning):
+        self.file_memory.save_word(user_id, word, meaning, "user")
+        return {"status": "learned", "word": word, "meaning": meaning}
+    
+    def save_feedback(self, user_id, query, response, rating):
+        self.file_memory.save_feedback(user_id, query, response, rating)
+        return {"status": "saved", "rating": rating}
+    
+    def console_chat(self):
+        """Консольный чат для Colab"""
+        user_id = "colab_user"
+        user_name = input("Как вас зовут? ") or "пользователь"
+        
+        print(f"\n👋 Привет, {user_name}! Я SMN Cloud. Чем могу помочь?")
+        print("(для выхода напишите 'exit' или 'quit')\n")
+        
+        while True:
+            try:
+                query = input("💬 Вы: ").strip()
+                
+                if query.lower() in ['exit', 'quit', 'выход']:
+                    print("👋 До свидания! Данные сохранены.")
+                    break
+                
+                if query:
+                    result = self.process_query(user_id, query, user_name)
+                    print(f"🤖 SMN: {result['response']}\n")
+                    
+            except KeyboardInterrupt:
+                print("\n👋 До свидания!")
+                break
+            except Exception as e:
+                print(f"❌ Ошибка: {e}")
+
+# ============================================
+# ШАГ 10: ЗАПУСК
+# ============================================
+if __name__ == "__main__":
+    smn = SMNCloud()
+    smn.console_chat()
